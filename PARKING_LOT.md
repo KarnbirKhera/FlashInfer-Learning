@@ -24,3 +24,20 @@ https://nerffer.github.io/matrixMultiplicationVisualization/
 http://matrixmultiplication.xyz/
 
 Both of the following links are great visualizations for matrix multiplication
+
+
+
+
+
+
+Interesting topics:
+
+- When you come across a row-wise matrix, you must use row wise access form of base formula
+
+Coordinate * Stride + Offset !!
+
+This is because when the array is flattened (how the kernel sees it), row numbers are kept contingent.
+
+If we used column wise access formula, we would get the wrong data!!
+
+(This insight took many hours I fear)

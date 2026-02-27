@@ -81,14 +81,14 @@ __global__ void transpose_shared(float* input, float* output, size_t width, size
 
 - Writes are coalesced to DRAM
 - Shared memory is accessed where each thread hits its respective bank
-- Avoids bank conflicts by adding one to our data's row size.
+- Avoids bank conflicts by adding one to our data's row size. This allows row to map to its own bank when requesting!
 */
 #define tileSize 32
 __global__ void transpose_shared_padded(float* input, float* output, size_t width, size_t height) {
     //Avoids bank conflicts by adding one to our data's row size.
     /*
-        Without: All rows % 32 results in hitting bank 0
-        With: Rows hit respective bank
+        Without: All rows % 32 results in hitting the same bank
+        With: Rows hit their respective bank in the 32 banks of shared memory
     */
     __shared__ float sharedMemory[tileSize][tileSize+1];
 
