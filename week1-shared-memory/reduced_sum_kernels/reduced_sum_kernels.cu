@@ -2,8 +2,31 @@
 
 
 /**
- * NOTE: The following kernels only calculate sums on a block basis. If the host requires 5 blocks due to a large n amount,
+ * NOTE: 
+ *     - The following kernels only calculate sums on a block basis. If the host requires 5 blocks due to a large n amount,
  *       we will have 5 partial sums which we must sum once again by running the kernel again.
+ * 
+ * Key Metric:
+ *     - Active Warps Per Scheduler:
+ *       - Naive: 11.10
+ *       - Interweaved: 10.62 (-4.30%)
+ *       - Sequential:  10.55 (-4.95%)
+ *       - Shfl_down:   8.87  (-20.12%)
+ * 
+ *  While at first the decrease in the Active Warps per Scheduler may seem bad, it is the exact metric
+ *  each of our optimizations is tackling!
+ * 
+ *  Lets start off with the naive. The naive kernel uses half the number of threads available and then continues to half that count
+ *  with each further iteration. The problem is, the threads are spread across all warps, this means all warps must be active throughout
+ *  the kernels run time, this increases overhead.
+ * 
+ *  Interweaved and Sequential: These kernels improve on the naive by clustering our active threads to a few warps. This allows the scheduler
+ *  to only focus on a few active warps, allowing for less overhead since we can idle non-used warps, freeing resources.
+ * 
+ *  Shlf_down: The use of this warp primitive allows us to bypass shared memory for the last iteration by letting each of the threads
+ *             within the last warp talk to each other. This allows Thread 0 to sum all of the threads in the warp. Avoiding shared memory
+ *             allows us to further optimize our reduced sum kernel.
+ * 
  */
 
 /*
@@ -136,7 +159,7 @@ __global__ void reduced_sum_sequential(float* input, float* output, int n) {
 
 
 /*
- Reduced Sum Sequential
+ Reduced Sum Sequential with Warp Shuffle
   61.41% faster than Naive
 
  - Prone to divergent branching because of "localId < stride"
@@ -181,7 +204,7 @@ __global__ void reduced_sum_sequential_shfl_down(float* input, float* output, in
             Thread 1 -> get Thread 17 value
             Thread 2 -> get Thread 18 value
             ....
-            Thread 16 -> get Thread 31 value
+            Thread 15 -> get Thread 31 value
         
         2nd iteration:
             Thread 0 -> get Thread 8 value
@@ -207,6 +230,7 @@ __global__ void reduced_sum_sequential_shfl_down(float* input, float* output, in
     if(localId < 32) {
         float sum = sharedMemory[localId];
         for(int offset = 16; offset > 0; offset >>= 1){
+            //The 0xFFFFFFFF means all threads in the warp participate
             sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
         }
         if(localId == 0) {
