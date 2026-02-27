@@ -46,7 +46,8 @@ __global__ void reduced_sum_naive(float* input, float* output, int n) {
 
 
 /*
- Reduced Sum Interweaved
+ Reduced Sum Interweaved:
+  35.96% faster than Naive
 
  - Prone to divergent branching because of "index + stride < blockDim.x"
    All active threads are clustered into required warps. Allowing entire warps to be inactive, resulting in decreased
@@ -91,6 +92,7 @@ __global__ void reduced_sum_interweaved(float* input, float* output, int n) {
 
 /*
  Reduced Sum Sequential
+  38.42% faster than Naive
 
  - Prone to divergent branching because of "localId < stride"
    All active threads are clustered into required warps. Allowing entire warps to be inactive, resulting in decreased
@@ -135,6 +137,7 @@ __global__ void reduced_sum_sequential(float* input, float* output, int n) {
 
 /*
  Reduced Sum Sequential
+  61.41% faster than Naive
 
  - Prone to divergent branching because of "localId < stride"
    All active threads are clustered into required warps. Allowing entire warps to be inactive, resulting in decreased
