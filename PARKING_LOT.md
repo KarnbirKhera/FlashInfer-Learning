@@ -25,7 +25,29 @@ http://matrixmultiplication.xyz/
 
 Both of the following links are great visualizations for matrix multiplication
 
+-----------------------
+Why is the naive uncoalesced access. At first I thought it was because in Matrix B we request for data column wise.
+Although one could argue on a warp scale, Matrix A actually causes our uncoalesced access where on a warp scale, we are going down each row where
+the addresses are not consecutive.
 
+                *Disputed Self Theory, to be parked in "PARKING_LOT.MD" for after project submission understanding*
+ At first I assumed Matrix B was the reason for this uncoalesced access, since on a thread level, we are requesting data from multiple rows.
+ In reality on a warp scale, Matrix A is the reason why we may have uncoalesced access.
+ This is because while a single thread in Matrix A travels across a row (coalesced), on a warp scale of 32 threads, we are actually 
+ following the row dimension (threadIdx.y). This means:
+   - Thread 0: Requests for address 0
+   - Thread 1: Requests for address 33 because we are going down the Matrix A rows
+
+---> Future perspective
+
+Matrix A requests 32 bytes, but they are not used instantly, and have to wait for the next k iteration use the requested data.
+This leaves a chance for the L1 or L2 to evict the data before the kernel has a chance to use it
+
+Matrix B requests 32 bytes and is not reliant on k. It is reliant on the iterator value col. This col value is determined by threadIdx.x
+which means all 32 threads can simutaniously use the bytes requested rather than needing to wait on iterator k.
+
+
+--------------------
 
 
 

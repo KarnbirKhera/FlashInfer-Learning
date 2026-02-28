@@ -33,10 +33,21 @@
  */
 
 
+/* 
+ GEMM Naive
+
+- Global Load Access Pattern
+  > 26.4 out of the 32 bytes transmitted per sector are utilized per thread
+     - We are not using all 32 bytes of the DRAM sector we requested.
+         >Matrix A requests 32 bytes, but they are not used instantly, and have to wait for the next k iteration use the requested data.
+          This leaves a chance for the L1 or L2 to evict the data before the kernel has a chance to use it
+         >Matrix B requests 32 bytes and is not reliant on k. It is reliant on the iterator value col. This col value is determined by threadIdx.x
+          which means all 32 threads can simutaniously use the bytes requested rather than needing to wait on iterator k.
+*/
 __global__ void gemm_naive(float* A, float* B, float* C, int M, int N, int K) {
     // Our current thread column wise within the block
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-    // Our current thread row wise within block
+    // Our current thread row wise within block. Note this value stays the same per warp where every thread will have the same row value.
     int row = blockIdx.y * blockDim.y + threadIdx.y;
 
     //Ensure when we're going down our row wise matrix A, we dont go out of bounds (M)
@@ -47,7 +58,12 @@ __global__ void gemm_naive(float* A, float* B, float* C, int M, int N, int K) {
         //We run K many times (the shared dimension)
         for(int k = 0; k < K; ++k) {
             //See note below for further explanation
-            sum += A[row * K + k] * B[k * N + col];
+            float A_value = A[row * K + k];
+            float B_value = B[k * N + col];
+            sum += A_value * B_value;
+
+            // Commented and seperated out for further SASS analysis into uncoalesced access reasoning
+            //sum += A[row * K + k] * B[k * N + col];
         }
 
         C[row * N + col] = sum;
@@ -151,12 +167,47 @@ These two applications of our base formula Coordinate * Stride + Offset allows u
  * ------------------------------------------------------------------
  */
 
+
+
+
+/* 
+ GEMM Tiled
+  29.64% faster than Naive
+
+
+- Shared memory use allows for re-use of loaded data.
+  > Observed by -9.37% decrease in Device Memory Load sectors (1425372 -> 1291852)
+    - A notice a small reduction in our DRAM load because we still require the same amount of data, but
+      our access is coalesced hence we are using all 32 bytes of every DRAM sector we call for.
+        > In the Naive kernel on average we would only use 26.4 bytes of out the 32 bytes we requested from each sector.
+  > Observed by -57.79% decrease in L2 Load Requests (5612387 -> 2368962)
+  > Observed by -96.83% decrease in L1 Load Requests (67141632 -> 2129920)
+  We see a significant reduction in the Load requests from both the L1 and L2 as we no longer explicitly require them once we load the tile
+  into Shared Memory, whereas in the Naive kernel we would hope the L1 and L2 had the data we needed.
+
+  > Observed +inf increase in Shared Memory
+     - Shared Memory Store (0 -> 2097152) 
+     - Shared Memory Load (0 -> 41943040)
+       > This is just a theory but one could assume if our Load count is significantly above our Store count,
+         our justification to use shared memory is correct. I say this because each one of these loads could have
+         been a L1 hit, L2 hit or a DRAM request which is significantly slower, but our use of Shared Memory allowed
+         prevented this. 
+          - The ratio between Load and Store is
+            > 41,943,040 / 2,097,152 = 20x data reuse that could have been slow L1, L2 or DRAM requests!
+
+- Shared memory use also solves the problem for Matrix A where the data requested may have been flushed from the L1 or L2 cache
+  by the time threads need the data as they wait on the k iterator, see naive section for more details.
+    > The problem is solved as Shared Memory is user controlled which allows us to keep the necessary data within fast reach.
+*/
+
 #define TILE_SIZE 32
 __global__ void gemm_tiled(float* A, float* B, float* C, int M, int N, int K) {
-
+/**************************** Intialize pointers & sum ***************************************************** */
+    //Create Shared Memory for both matrices
     __shared__ float A_shared[TILE_SIZE][TILE_SIZE];
     __shared__ float B_shared[TILE_SIZE][TILE_SIZE];
 
+    //Get thread ID, usually we would do blockDim but the focus is on our current tile
     int row = blockIdx.y * TILE_SIZE + threadIdx.y;
     int col = blockIdx.x * TILE_SIZE + threadIdx.x;
     float sum = 0.0f;
@@ -164,31 +215,52 @@ __global__ void gemm_tiled(float* A, float* B, float* C, int M, int N, int K) {
     //Ceiling Integer Divison
     int numOfTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
 
+
     for(int i = 0; i < numOfTiles; ++i) {
-        
+/****************************Load tile A and tile B into Shared Memory ******************************************************/
+
+        // i allows us to slide across K 
+        // TILE_SIZE determines the size of the tile
+        // threadIdx.x represents all 32 threads within our warp, meaning we are able to parallelize
+        //  any computation derived from threadIdx.x
         int aCol = i * TILE_SIZE + threadIdx.x;
         if(row < M && aCol < K) {
+            // We do [ThreadIdx.y][ThreadIdx.x] because Matrix A is stored row wise
+            // Matching the row wise [fixed][changes] notation
             A_shared[threadIdx.y][threadIdx.x] = A[row * K + aCol];
         } else {
             A_shared[threadIdx.y][threadIdx.x] = 0.0f;
         }
 
+        // i allows us to slide across K
+        // TILE_SIZE determines the size of the tile
+        // threadIdx.y determines the row, threadIdx.y stays the same value across the warp.
         int bRow = i * TILE_SIZE + threadIdx.y;
         if(bRow < K && col < N) {
+            // Store current element in shared memory
+            // bRow = Our current row
+            // N = Size of our row
+            // col = Current value, derived from threadIdx.x and is parallelized
             B_shared[threadIdx.y][threadIdx.x] = B[bRow * N + col];
         } else {
             B_shared[threadIdx.y][threadIdx.x] = 0.0f;
         }
 
+        //Ensure all threads have completed, and data is ready
         __syncthreads();
 
+
+/****************************Compute DOT product freely in Shared Memory ***************************************************** */
+        //DOT product from shared memory
         for(int k = 0; k < TILE_SIZE; k++) {
             sum += A_shared[threadIdx.y][k] * B_shared[k][threadIdx.x];
         }
 
+        //Ensure summing is complete
         __syncthreads();
     }
-
+/**************************** Write sum to C ***************************************************** */
+    //Write sum to Matrix C
     if(row < M && col < N) {
         C[row * N + col] = sum;
     }
@@ -197,7 +269,64 @@ __global__ void gemm_tiled(float* A, float* B, float* C, int M, int N, int K) {
 
 
 
+
+
 #define TILE_SIZE 32
+__global__ void gemm_tiled_register(float* A, float* B, float* C, int M, int N, int K) {
+    __shared__ float A_shared[TILE_SIZE][TILE_SIZE];
+    __shared__ float B_shared[TILE_SIZE][TILE_SIZE];
+
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x; //Parallelized across warp
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    float sum = 0;
+
+    int numOfTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+    
+    for(int i = 0; i < numOfTiles; i++) {
+        //We grab row from Matrix A, we require a column iterator
+        int aCol = i * K + threadIdx.x;
+        if(row < M && aCol < K) {
+            // [fixed][changing]
+            // currentRow * sizeOfRow + current Element in row
+            A_shared[threadIdx.y][threadIdx.x] = A[row * K + threadIdx.x];
+        } else {
+            A_shared[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        //We grab column from Matrix B, need a row iterator
+        int bRow = i * N + threadIdx.y;
+        if(row < M && col < K) {
+            B_shared[threadIdx.y][threadIdx.x] = B[bRow * N + threadIdx.x];
+        } else {
+            A_shared[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        //Compute
+        for(int k = 0; k < TILE_SIZE; k++) {
+            A_shared[threadIdx.y][k] * B_shared[k][threadIdx.x];
+        }
+
+        //Store
+            if(row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
  int main() {
     const int M = 1024;
