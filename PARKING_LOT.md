@@ -53,7 +53,7 @@ which means all 32 threads can simutaniously use the bytes requested rather than
 
 
 Interesting topics:
-
+--------------------
 - When you come across a row-wise matrix, you must use row wise access form of base formula
 
 Coordinate * Stride + Offset !!
@@ -63,3 +63,100 @@ This is because when the array is flattened (how the kernel sees it), row number
 If we used column wise access formula, we would get the wrong data!!
 
 (This insight took many hours I fear)
+--------------------
+
+
+
+--------------------
+
+Flattening Row Wise Matrix:
+WhichRow * HowBigIsTheRow + WhereInTheRow (column)
+
+Flattening Column Wise Matrix:
+WhichColumn * ColumnSize + WhereInColumn (row)
+
+
+Single axis Coordinate Access:
+Where * Size + WhereIn
+ or
+(higher level) * (lower level) + (lower level offset)
+ 
+--------------------
+
+
+--------------------
+If threads are to small for problem size (Threads to Shared Memory), use Flatten > Expand > Fold
+Assume Threads 8x8
+Assume Shared Memory 32x32
+
+1. Flatten
+     - You flatten threads to 0-63 ()
+2. Expand
+     - You scale those 0-63 threads to match 1024 
+3. Fold
+     - You use divison 32 for row, modulus 32 for column
+
+
+Lock + Slide + Micro
+1. #TODO
+--------------------
+
+
+--------------------
+The theoretical framework that came from hours of struggling, I believe it will help me with my current GEMM Register Accumlated 2D, and the kernels in the future.
+
+This framework captures my current scope of knowledge, and I'm sure it doesn't apply to all kernels, and also may be inconsistent.
+
+ > The Two Tree Framework <
+
+      
+Two Tree Table:
+
+  Execution (Threads)       Memory (Data)
+
+Grid   32 x 32          Global   1024 x 1024
+Block   8 x 8           Shared    32 x 32
+Thread    1             Register   4 x 4
+
+- This tree table allows us to explicitly see the difference between the Execution and Memory trees.
+- This tree table shows us whether we need a for loop for our Execution to Memory mapping
+   > Ex. For our 32 x 32 Grid to fully cover our 1024 x 1024, we must slides across Global 32 times (1024/32).
+   > Ex. For our 8 x 8 Block to fully map to our 32 x 32 Shared Memory, we must stamp across Shared Memory 16 times (32*32/8*8)
+   > Ex. For our 1 thread to fully map to our 4 x 4 register, our thread must iterate 16 times over our Register (16/1) 
+- This tree also allows us to confirm whether our variable correctly covers the respective dimension space
+   > Ex. Say we have
+      - int aCol = tileId * TILE_SIZE + sCol;
+    > Assuming aCol is in the Matrix A dimension (Global) we can say that our maximum value must be 1023.
+      - tileId = 0-31
+      - TILE_SIZE = 32
+      - sCol = 0-31
+    > When we take the maximum value of each variable, we get at total of 1023. This means we have properly covered this 1024 dimension space.
+
+Two Tree Dimensional Analysis Table
+
+EXECUTION TABLE
+
+ Level |   Size   |   Size Unit     |          Index           |     Unit      |
+-------|----------|-----------------|--------------------------|---------------|
+Grid   | gridDim  |    [BLOCKS]     | blockIdx.x   blockIdx.y  |    [BLOCK]    |
+Block  | blockDim | [THREADS/BLOCK] | threadIdx.x  threadIdx.y |   [THREAD ]   |
+Thread |    1     |    [THREAD]     | localId                  | [FLAT_THREAD] |
+
+
+MEMORY TABLE
+
+ Level   |     Size        |    Size Unit      |    Index    |   Unit    |
+---------|-----------------|-------------------|-------------|-----------|
+Global   |    M, N, K      |    [ELEMENTS]     | aCol   aRow | [ELEMENT] |
+         |                 |                   | bCol   bRow | [ELEMENT] |
+         |                 |                   | cCol   cRow | [ELEMENT] |
+         |                 |                   |             |           |
+Shared   |   TILE_SIZE     | [ELEMENTS/BLOCK]  | sCol   sRow | [ELEMENT] |
+Register | WORK_PER_THREAD | [ELEMENTS/THREAD] | rCol   rRow | [ELEMENT] |
+
+
+- The Size and Size Unit allow us to bridge our Execution and Memory Table
+- When we:
+   > Flatten from 2D to 1D, we can use the following formula  WhichRow * SizeOfRow + WhereInRow
+   - We can use dimensional analysis to confirm whether our units are consistent.
+- 

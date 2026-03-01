@@ -272,45 +272,78 @@ __global__ void gemm_tiled(float* A, float* B, float* C, int M, int N, int K) {
 
 
 #define TILE_SIZE 32
-__global__ void gemm_tiled_register(float* A, float* B, float* C, int M, int N, int K) {
-    __shared__ float A_shared[TILE_SIZE][TILE_SIZE];
+#define THREAD_ITEMS 4
+
+__global__ void gemm_register_22d(float* A, float* B, float* C, int M, int N, int K) {
+
+    __shared__ float A_shared[TILE_SIZE][TILE_SIZE+1];
     __shared__ float B_shared[TILE_SIZE][TILE_SIZE];
 
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x; //Parallelized across warp
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    float sum = 0;
+    // Each thread owns a 4x4 block of C
+    int rowBase = blockIdx.y * TILE_SIZE + threadIdx.y * THREAD_ITEMS;
+    int colBase = blockIdx.x * TILE_SIZE + threadIdx.x * THREAD_ITEMS;
+
+    // 16 accumulators in registers
+    float sum[THREAD_ITEMS][THREAD_ITEMS] = {{0.0f}};
 
     int numOfTiles = (K + TILE_SIZE - 1) / TILE_SIZE;
-    
-    for(int i = 0; i < numOfTiles; i++) {
-        //We grab row from Matrix A, we require a column iterator
-        int aCol = i * K + threadIdx.x;
-        if(row < M && aCol < K) {
-            // [fixed][changing]
-            // currentRow * sizeOfRow + current Element in row
-            A_shared[threadIdx.y][threadIdx.x] = A[row * K + threadIdx.x];
-        } else {
-            A_shared[threadIdx.y][threadIdx.x] = 0.0f;
+
+    // Loading setup: 64 threads, 1024 elements per tile, 16 loads each
+    int linearIdx = threadIdx.y * blockDim.x + threadIdx.x;
+    int loadPerThread = (TILE_SIZE * TILE_SIZE) / (blockDim.x * blockDim.y);
+
+    for (int i = 0; i < numOfTiles; i++) {
+
+        // Collaborative load: each thread loads 16 elements of A and B
+        for (int l = 0; l < loadPerThread; i++) {
+            int idx = l * (blockDim.x * blockDim.y) + linearIdx;
+            int sRow = idx / TILE_SIZE;
+            int sCol = idx % TILE_SIZE;
+
+            int aRow = blockIdx.y * TILE_SIZE + sRow;
+            int aCol = i * TILE_SIZE + sCol;
+            if (aRow < M && aCol < K)
+                A_shared[sRow][sCol] = A[aRow * K + aCol];
+            else
+                A_shared[sRow][sCol] = 0.0f;
+
+            int bRow = i * TILE_SIZE + sRow;
+            int bCol = blockIdx.x * TILE_SIZE + sCol;
+            if (bRow < K && bCol < N)
+                B_shared[sRow][sCol] = B[bRow * N + bCol];
+            else
+                B_shared[sRow][sCol] = 0.0f;
         }
 
-        //We grab column from Matrix B, need a row iterator
-        int bRow = i * N + threadIdx.y;
-        if(row < M && col < K) {
-            B_shared[threadIdx.y][threadIdx.x] = B[bRow * N + threadIdx.x];
-        } else {
-            A_shared[threadIdx.y][threadIdx.x] = 0.0f;
+        __syncthreads();
+
+        // Compute: outer product of register fragments
+        for (int k = 0; k < TILE_SIZE; ++k) {
+            float a[THREAD_ITEMS];
+            float b[THREAD_ITEMS];
+
+            for (int ri = 0; ri < THREAD_ITEMS; ++ri)
+                a[ri] = A_shared[threadIdx.y * THREAD_ITEMS + ri][k];
+
+            for (int ci = 0; ci < THREAD_ITEMS; ++ci)
+                b[ci] = B_shared[k][threadIdx.x * THREAD_ITEMS + ci];
+
+            for (int ri = 0; ri < THREAD_ITEMS; ++ri)
+                for (int ci = 0; ci < THREAD_ITEMS; ++ci)
+                    sum[ri][ci] += a[ri] * b[ci];
         }
 
-        //Compute
-        for(int k = 0; k < TILE_SIZE; k++) {
-            A_shared[threadIdx.y][k] * B_shared[k][threadIdx.x];
-        }
-
-        //Store
-            if(row < M && col < N) {
-        C[row * N + col] = sum;
+        __syncthreads();
     }
 
+    // Write 4x4 results to C
+    for (int ri = 0; ri < THREAD_ITEMS; ++ri) {
+        for (int ci = 0; ci < THREAD_ITEMS; ++ci) {
+            int r = rowBase + ri;
+            int c = colBase + ci;
+            if (r < M && c < N)
+                C[r * N + c] = sum[ri][ci];
+        }
     }
 }
 
@@ -318,8 +351,106 @@ __global__ void gemm_tiled_register(float* A, float* B, float* C, int M, int N, 
 
 
 
+/*
+    2D is geniunely troubling, requires additonal framework
+
+    - Define dimensions for Global, Shared and Register dimension
+    - Who am I? (our pointer/index what does it track)
+    - Define workload (before loop, calcualt ehow much manual labor each thread has to do)
+*/
+
+/* 
+    GRID DIMENSION: 1024x1024 (Passed into the function)
+        - blockIdx.x > Where are we in the grid horizontally 
+        - blockIdx.y > Where are we in the grid vertically
+        - gridDim.x  > How big is the block horizontally
+    BLOCK DIMENSION: 8x8
+        - threadIdx.x > Where are we in the block horizontally 
+        - threadIdx.y > Where are we in the block vertically
+        - blockDim.x  > How big is the block horizontally
+    SHARED DIMENSION: 32x32
+        - TILE_SIZE > How big shared memory is horizontally/vertically
+    REGISTER DIMENSION: 4x4
+        - WORK_PER_THREAD > How much work each thread does/the stride
 
 
+ FORMULA DERIVATION FOR THIS USE CASE:
+    Base formula: Coordinate * Stride + Offset
+        
+        translates to:
+
+    In human nomenclature: WhereAmI * HowBigAmI + WhereAmIWithinIt?
+
+        translates to:
+
+    Matrix is in row form hence: WhichRow * HowBigIsTheRow + WhereInTheRowAmI?
+
+
+----
+OH MY GOD EVERYTHING IS TECHNICALLY FLATTENED
+THE  TWO TREE FRAMEWORK IS FANTASTIC!!!
+
+*/
+
+#define TILE_SIZE 32
+#define WORK_PER_THREAD 4
+__global__ void gemm_register_2d(float* A, float* B, float* C, int M, int N, int K) {
+    
+    /*
+        Shell and Allocations
+    */
+    __shared__ float A_shared[32][33]; // [ELEMENT]
+    __shared__ float B_shared[32][32]; // [ELEMENT]
+
+    //Accumlate 4x4 in registers, avoid Shared Memory
+    float accumulate[WORK_PER_THREAD][WORK_PER_THREAD] = {{0.0f}}; // [ELEMENT]
+
+    //Thread mapping
+    //TODO: Redo the dimensional analysis on these parts
+    int col = blockIdx.x * blockDim.x + threadIdx.x * WORK_PER_THREAD; // Block * Thread + Thread = [Thread] 0-7
+    int row = blockIdx.y * blockDim.y + threadIdx.y * WORK_PER_THREAD; // Block * Thread + Thread = [Thread] 0-7
+    int flattenedId = threadIdx.y * blockDim.x + threadIdx.x; // Thread * Thread + Thread = [Thread] 0 - 63
+    
+    int numOfTiles = K / TILE_SIZE; // 32 
+    int numOfStrides = (TILE_SIZE * TILE_SIZE) / (blockDim.x * blockDim.y); // 16
+
+    // SLIDING LOOP - We move along the K dimension
+    for(int tileId = 0; tileId < numOfTiles; tileId++) {
+
+        //Task One: Load to Share Memory
+        
+        // STAMPING LOOP - We cover 32x32 area
+        for(int stride = 0; stride < numOfStrides; stride++) {
+            // 1. Flatten to flat thread count 0 - 63
+            // 2. Expand to Shared Memory flat thread count 0 - 1023
+            // 3. Fold to Shared Memory Dimension (32x32)
+            // 4. Matrix A & B to Shared Memory
+            
+            // 2. 
+            //Stored row wise hence formula is: Current Row * Size of Row + column 
+            int sharedMemoryId = stride * (blockDim.x * blockDim.y) + flattenedId; // Max value check: 15 * (8 * 8) + 63 = 1023, matches 0-1023 expected
+
+            //3.
+            int sRow = sharedMemoryId / 32; // [ELEMENT]
+            int sCol = sharedMemoryId % 32; // [ELEMENT]
+
+            // 4.
+            // Matrix A
+            //  Must be X Axis Access. Where * Size + WhereIn
+            int aCol = tileId * TILE_SIZE + sCol; // [BLOCK] * [ELEMENT/BLOCK] + [ELEMENT] = [ELEMENT], 0 - 1023
+            int aRow = blockIdx.y * TILE_SIZE + sRow; // [BLOCK] * [ELEMENT/BLOCK] + [ELEMENT] = [ELEMENT], 0 - 1023
+            if(aCol < K && aRow < M) {
+
+            } else {
+
+            }
+            
+
+
+        }
+    }
+
+}
 
 
 
@@ -364,6 +495,8 @@ __global__ void gemm_tiled_register(float* A, float* B, float* C, int M, int N, 
     dim3 block(TILE_SIZE, TILE_SIZE);
     dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
 
+    dim3 block_reg(TILE_SIZE / THREAD_ITEMS, TILE_SIZE / THREAD_ITEMS);  // (8, 8) = 64 threads
+
     auto verify = [&](const char* name) {
         cudaDeviceSynchronize();
         cudaMemcpy(hC_gpu, dC, sizeC, cudaMemcpyDeviceToHost);
@@ -386,6 +519,8 @@ __global__ void gemm_tiled_register(float* A, float* B, float* C, int M, int N, 
     gemm_tiled<<<grid, block>>>(dA, dB, dC, M, N, K);
     verify("gemm_tiled");
 
+    gemm_register_2d<<<grid, block_reg>>>(dA, dB, dC, M, N, K);
+    verify("gemm_register_2d");
 
     free(hA);
     free(hB);
