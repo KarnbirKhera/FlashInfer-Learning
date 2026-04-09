@@ -935,7 +935,7 @@ our lifecycle tree (temporal reuse)
 
 maybe use 7 optimization equations on each data layout DOT tensor operation to see what is the bottleneck for that specific tile of the table
 cause only the data size changes going thru it that structure will always be the same
-the 7 equations use hardware numbers ANDDD has both memory and execution operations holy fuck!!!!!
+the 7 equations use hardware numbers ANDDD has both memory and execution operations holy!!!!!
 
 TENSOR OPERATION TELLS US DATA MOVNG OR DATA PROCESSING
 
